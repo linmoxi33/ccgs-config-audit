@@ -1,0 +1,40 @@
+{
+  "counts": {
+    "agents": 1,
+    "errors": 4,
+    "skills": 2,
+    "warnings": 0
+  },
+  "findings": [
+    {
+      "code": "REF001",
+      "line": 3,
+      "message": "dangling subagent_type: ghost (no .claude/agents/ghost.md)",
+      "path": ".claude/skills/alpha/SKILL.md",
+      "severity": "error"
+    },
+    {
+      "code": "REF002",
+      "line": 5,
+      "message": "dangling skill reference: /nope (no .claude/skills/nope/SKILL.md)",
+      "path": ".claude/skills/alpha/SKILL.md",
+      "severity": "error"
+    },
+    {
+      "code": "DOC001",
+      "line": 1,
+      "message": "documents missing.sh but it is not on disk",
+      "path": ".claude/docs/hooks-reference.md",
+      "severity": "error"
+    },
+    {
+      "code": "STG001",
+      "line": 1,
+      "message": "stage drift: project.yaml='Production' but production/stage.txt='Polish'",
+      "path": "project.yaml",
+      "severity": "error"
+    }
+  ],
+  "ok": false,
+  "root": "/home/ubuntu/GitHub/work/trending/ccgs-config-audit/examples/in/mini-pack"
+}

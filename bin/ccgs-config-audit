@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""ccgs-config-audit: offline consistency audit for Claude Code agent/skill packs.
+
+Reads a project root, parses .claude/skills/*/SKILL.md and .claude/agents/*.md
+frontmatter, resolves cross-file references, and compares project.yaml stage
+against the legacy production/stage.txt mirror. No network, no third-party deps.
+
+Exit codes: 0 clean, 1 findings, 2 usage/input error.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+SKILL_REQUIRED = ["name", "description", "argument-hint", "user-invocable", "allowed-tools"]
+AGENT_REQUIRED = ["name", "description", "tools", "model"]
+KNOWN_TOOLS = {
+    "Read", "Glob", "Grep", "Write", "Edit", "Bash", "WebSearch", "WebFetch",
+    "Agent", "AskUserQuestion", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
+    "NotebookEdit", "TodoWrite", "SlashCommand",
+}
+# Commands provided by the Claude Code runtime, not by the pack.
+BUILTIN_COMMANDS = {
+    "clear", "compact", "review", "debug", "security-review", "simplify",
+    "command", "help", "model", "config", "init", "status", "cost", "resume",
+}
+STAGES = {
+    "Concept", "Systems Design", "Technical Setup", "Pre-Production",
+    "Production", "Polish", "Release",
+}
+SKILL_REF_RE = re.compile(r"(?<![\w/<>])/([a-z][a-z0-9-]{1,40})(?![\w.\-/*\[])")
+PATH_REF_RE = re.compile(r"\.claude/(rules|hooks|scripts)/([A-Za-z0-9_.\-]+\.(?:md|sh|py|awk))")
+SUBAGENT_RE = re.compile(r"subagent_type:\s*`?([^`\n]+)")
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def finding(code, severity, path, line, message):
+    return {"code": code, "severity": severity, "path": path, "line": line, "message": message}
+
+
+def split_frontmatter(text):
+    """Return (fields dict, body, error). Fields are raw strings."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text, "missing frontmatter opener"
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text, "unclosed frontmatter"
+    fields = {}
+    for i in range(1, end):
+        raw = lines[i]
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if ":" not in raw:
+            return fields, "\n".join(lines[end + 1:]), "non key:value line %d" % (i + 1)
+        key, _, val = raw.partition(":")
+        key = key.strip()
+        if key in fields:
+            return fields, "\n".join(lines[end + 1:]), "duplicate key %s (line %d)" % (key, i + 1)
+        fields[key] = val.strip().strip('"').strip("'")
+    return fields, "\n".join(lines[end + 1:]), None
+
+
+def strip_fences(body):
+    """Blank out fenced code blocks so examples are not audited as references."""
+    out, inside = [], False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            out.append("")
+            continue
+        out.append("" if inside else line)
+    return out
+
+
+def tool_names(raw):
+    names, depth, buf = [], 0, ""
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            names.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    names.append(buf)
+    return [n.split("(")[0].strip() for n in names if n.strip()]
+
+
+def audit(root):
+    findings = []
+    claude = os.path.join(root, ".claude")
+    skills_dir = os.path.join(claude, "skills")
+    agents_dir = os.path.join(claude, "agents")
+
+    if not os.path.isdir(claude):
+        raise ValueError("no .claude directory under %s" % root)
+
+    agent_names = set()
+    for fn in sorted(os.listdir(agents_dir)) if os.path.isdir(agents_dir) else []:
+        if fn.endswith(".md"):
+            agent_names.add(fn[:-3])
+    skill_names = set()
+    for d in sorted(os.listdir(skills_dir)) if os.path.isdir(skills_dir) else []:
+        if os.path.isfile(os.path.join(skills_dir, d, "SKILL.md")):
+            skill_names.add(d)
+
+    # ---- agents -----------------------------------------------------------
+    if os.path.isdir(agents_dir):
+        for fn in sorted(os.listdir(agents_dir)):
+            if not fn.endswith(".md"):
+                continue
+            rel = ".claude/agents/" + fn
+            fields, _body, err = split_frontmatter(read_text(os.path.join(agents_dir, fn)))
+            if err:
+                findings.append(finding("FM001", "error", rel, 1, "frontmatter: " + err))
+                continue
+            for key in AGENT_REQUIRED:
+                if not fields.get(key):
+                    findings.append(finding("FM002", "error", rel, 1, "missing required key: " + key))
+            if fields.get("name") and fields["name"] != fn[:-3]:
+                findings.append(finding("FM003", "error", rel, 1,
+                                        "name %r != filename %r" % (fields["name"], fn[:-3])))
+            if fields.get("model") and fields["model"] not in {"inherit", "sonnet", "opus", "haiku"}:
+                findings.append(finding("FM004", "warn", rel, 1,
+                                        "unknown model: " + fields["model"]))
+            for key in ("tools", "disallowedTools"):
+                for name in tool_names(fields.get(key, "")):
+                    if name and name not in KNOWN_TOOLS:
+                        findings.append(finding("FM005", "warn", rel, 1,
+                                                "unknown tool in %s: %s" % (key, name)))
+            for target in re.findall(r"\[([^\]]+)\]", fields.get("skills", "")):
+                for s in target.split(","):
+                    s = s.strip()
+                    if s and s not in skill_names:
+                        findings.append(finding("REF004", "error", rel, 1,
+                                                "preloaded skill does not exist: " + s))
+
+    # ---- skills -----------------------------------------------------------
+    if os.path.isdir(skills_dir):
+        for d in sorted(os.listdir(skills_dir)):
+            path = os.path.join(skills_dir, d, "SKILL.md")
+            if not os.path.isfile(path):
+                continue
+            rel = ".claude/skills/%s/SKILL.md" % d
+            fields, body, err = split_frontmatter(read_text(path))
+            if err:
+                findings.append(finding("FM001", "error", rel, 1, "frontmatter: " + err))
+                continue
+            for key in SKILL_REQUIRED:
+                if not fields.get(key):
+                    findings.append(finding("FM002", "error", rel, 1, "missing required key: " + key))
+            if fields.get("name") and fields["name"] != d:
+                findings.append(finding("FM003", "error", rel, 1,
+                                        "name %r != directory %r" % (fields["name"], d)))
+            for name in tool_names(fields.get("allowed-tools", "")):
+                if name and name not in KNOWN_TOOLS:
+                    findings.append(finding("FM005", "warn", rel, 1, "unknown tool: " + name))
+            if not re.search(r"^#\s+\S", body, re.M):
+                findings.append(finding("FM006", "warn", rel, 1, "no top-level H1 in body"))
+
+            for lineno, line in enumerate(strip_fences(body), start=1):
+                for m in SUBAGENT_RE.finditer(line):
+                    target = m.group(1).strip().rstrip("`").rstrip(".,;")
+                    if target.startswith("["):
+                        continue
+                    for name in [t.strip() for t in target.split(",") if t.strip()]:
+                        if name not in agent_names:
+                            findings.append(finding(
+                                "REF001", "error", rel, lineno,
+                                "dangling subagent_type: %s (no .claude/agents/%s.md)" % (name, name)))
+                for cmd in SKILL_REF_RE.findall(line):
+                    if cmd in BUILTIN_COMMANDS or cmd in skill_names:
+                        continue
+                    findings.append(finding(
+                        "REF002", "error", rel, lineno,
+                        "dangling skill reference: /%s (no .claude/skills/%s/SKILL.md)" % (cmd, cmd)))
+                for kind, name in PATH_REF_RE.findall(line):
+                    if not os.path.exists(os.path.join(claude, kind, name)):
+                        findings.append(finding(
+                            "REF003", "error", rel, lineno,
+                            "dangling path reference: .claude/%s/%s" % (kind, name)))
+
+    # ---- doc vs disk ------------------------------------------------------
+    for doc, folder, ext in (("hooks-reference.md", "hooks", ".sh"),
+                             ("rules-reference.md", "rules", ".md")):
+        docpath = os.path.join(claude, "docs", doc)
+        target = os.path.join(claude, folder)
+        if not os.path.isfile(docpath) or not os.path.isdir(target):
+            continue
+        text = read_text(docpath)
+        mentioned = set()
+        for line in text.splitlines():
+            if not line.startswith("|"):
+                continue
+            m = re.match(r"\|\s*`([A-Za-z0-9_.\-]+%s)`" % re.escape(ext), line)
+            if m:
+                mentioned.add(m.group(1))
+        on_disk = {f for f in os.listdir(target) if f.endswith(ext)}
+        for missing in sorted(mentioned - on_disk):
+            findings.append(finding("DOC001", "error", ".claude/docs/" + doc, 1,
+                                    "documents %s but it is not on disk" % missing))
+        for extra in sorted(on_disk - mentioned):
+            findings.append(finding("DOC002", "warn", ".claude/docs/" + doc, 1,
+                                    "%s exists on disk but is not documented" % extra))
+
+    # ---- stage dual-write -------------------------------------------------
+    yaml_path = os.path.join(root, "project.yaml")
+    txt_path = os.path.join(root, "production", "stage.txt")
+    y_stage = None
+    if os.path.isfile(yaml_path):
+        inside_project, indent = False, None
+        for line in read_text(yaml_path).splitlines():
+            if re.match(r"^project:\s*$", line):
+                inside_project = True
+                continue
+            if inside_project:
+                if re.match(r"^\S", line):
+                    inside_project = False
+                    continue
+                m = re.match(r"^\s+stage:\s*(.+?)\s*$", line)
+                if m:
+                    y_stage = m.group(1).strip().strip('"').strip("'")
+    t_stage = None
+    if os.path.isfile(txt_path):
+        t_stage = read_text(txt_path).strip() or None
+    if y_stage and y_stage not in STAGES:
+        findings.append(finding("STG002", "error", "project.yaml", 1,
+                                "stage %r is not one of the 7 stages" % y_stage))
+    if y_stage and t_stage and y_stage != t_stage:
+        findings.append(finding("STG001", "error", "project.yaml", 1,
+                                "stage drift: project.yaml=%r but production/stage.txt=%r"
+                                % (y_stage, t_stage)))
+    if bool(y_stage) != bool(t_stage):
+        findings.append(finding("STG003", "error", "project.yaml", 1,
+                                "half-written stage: project.yaml=%r, production/stage.txt=%r"
+                                % (y_stage, t_stage)))
+
+    return {
+        "ok": not any(f["severity"] == "error" for f in findings),
+        "root": os.path.abspath(root),
+        "counts": {
+            "skills": len(skill_names),
+            "agents": len(agent_names),
+            "errors": sum(1 for f in findings if f["severity"] == "error"),
+            "warnings": sum(1 for f in findings if f["severity"] == "warn"),
+        },
+        "findings": findings,
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ccgs-config-audit",
+        description="Offline consistency audit for Claude Code agent/skill packs.")
+    ap.add_argument("root", nargs="?", default=".", help="project root (default: .)")
+    ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    ap.add_argument("--strict", action="store_true", help="treat warnings as failures")
+    args = ap.parse_args(argv)
+
+    if not os.path.isdir(args.root):
+        sys.stderr.write("error: not a directory: %s\n" % args.root)
+        return 2
+    try:
+        report = audit(args.root)
+    except ValueError as exc:
+        sys.stderr.write("error: %s\n" % exc)
+        return 2
+
+    failed = report["counts"]["errors"] > 0 or (
+        args.strict and report["counts"]["warnings"] > 0)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        for f in report["findings"]:
+            print("%s:%s: %s [%s] %s" % (f["path"], f["line"], f["severity"], f["code"], f["message"]))
+        print("skills=%d agents=%d errors=%d warnings=%d -> %s" % (
+            report["counts"]["skills"], report["counts"]["agents"],
+            report["counts"]["errors"], report["counts"]["warnings"],
+            "FAIL" if failed else "PASS"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
